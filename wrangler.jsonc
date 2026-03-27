@@ -26,5 +26,11 @@
   ],
   "ai": {
     "binding": "AI"
-  }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "PLAYBOOK_KV",
+      "id": "aa4dac5de4ba48e59b928649f94daf1d"
+    }
+  ]
 }

@@ -15,6 +15,7 @@ type Env = {
   SLACK_DISABLED?: string;
   AI: Ai;
   DB: D1Database;
+  PLAYBOOK_KV: KVNamespace;
 };
 
 type WorkflowParams = {
@@ -276,9 +277,19 @@ export class CallReviewWorkflow extends WorkflowEntrypoint<Env, WorkflowParams> 
       retries: { limit: 2, delay: '15 seconds', backoff: 'exponential' },
       timeout: '5 minutes',
     }, async () => {
+      const playbook = await this.env.PLAYBOOK_KV.get('metana-playbook') ?? '';
+
       const response = await this.env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
         max_tokens: 4000,
         messages: [
+          {
+            role: 'user',
+            content: `Here is the Metana sales playbook and closer handbook. Use this as context when reviewing the call:\n\n${playbook}`,
+          },
+          {
+            role: 'assistant',
+            content: 'Understood. I have read the Metana sales playbook and will use it as context for my review.',
+          },
           {
             role: 'system',
             content: `You are "Apex," the world's most effective and insightful sales coach. Your expertise combines tactical execution, strategic conversational intelligence, and the psychology of peak performance.
