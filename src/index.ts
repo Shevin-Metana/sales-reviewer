@@ -26,6 +26,14 @@ type WorkflowParams = {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+function markdownToHtml(md: string): string {
+  return md
+    .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')   // **bold**
+    .replace(/^#{1,3} (.+)$/gm, '<b>$1</b>')       // ## headings
+    .replace(/^\s*[\*\-] /gm, '• ')                // * bullets → •
+    .replace(/\n/g, '<br>\n');                      // line breaks
+}
+
 async function isAlreadyProcessed(db: D1Database, meetingId: string): Promise<boolean> {
   const row = await db.prepare(
     'SELECT meeting_id FROM processed_meetings WHERE meeting_id = ?'
@@ -107,14 +115,34 @@ export default {
       return new Response('Method not allowed', { status: 405 });
     }
 
-    const secret = req.headers.get('x-webhook-secret');
-    if (secret !== env.FIREFLIES_WEBHOOK_SECRET) {
-      return new Response('Unauthorized', { status: 401 });
+    const rawBody = await req.text();
+
+    // Fireflies sends HMAC-SHA256 signature in x-hub-signature header
+    const signature = req.headers.get('x-hub-signature');
+    if (signature) {
+      const key = await crypto.subtle.importKey(
+        'raw',
+        new TextEncoder().encode(env.FIREFLIES_WEBHOOK_SECRET),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+      );
+      const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(rawBody));
+      const expected = 'sha256=' + Array.from(new Uint8Array(mac)).map(b => b.toString(16).padStart(2, '0')).join('');
+      if (expected !== signature) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+    } else {
+      // Fallback: plain secret header
+      const secret = req.headers.get('x-webhook-secret');
+      if (secret !== env.FIREFLIES_WEBHOOK_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
     }
 
     let body: any;
     try {
-      body = await req.json();
+      body = JSON.parse(rawBody);
     } catch {
       return new Response('Invalid JSON', { status: 400 });
     }
@@ -160,11 +188,19 @@ export default {
       return new Response('Not a closer call, skipping', { status: 200 });
     }
 
+    // Check if this is a career consultation
+    if (!transcript.title?.includes('Metana Career Consultation')) {
+      return new Response('Not a career consultation, skipping', { status: 200 });
+    }
+
     // Build participants array for workflow
-    const participants = participantEmails.map(email => ({
-      email,
-      name: email.split('@')[0],
-    }));
+    const participants = participantEmails.map(email => {
+      const prefix = email.split('@')[0];
+      return {
+        email,
+        name: prefix.charAt(0).toUpperCase() + prefix.slice(1),
+      };
+    });
 
     // Trigger workflow
     try {
@@ -213,13 +249,21 @@ export default {
         continue;
       }
 
+      if (!meeting.title?.includes('Metana Career Consultation')) {
+        console.log(`Not a career consultation: ${meeting.id}`);
+        continue;
+      }
+
       // Build participants array for workflow
       const participants = participantEmails
         .filter(e => !e.includes('fireflies'))
-        .map(email => ({
-          email,
-          name: email.split('@')[0],
-        }));
+        .map(email => {
+          const prefix = email.split('@')[0];
+          return {
+            email,
+            name: prefix.charAt(0).toUpperCase() + prefix.slice(1),
+          };
+        });
 
       console.log(`Triggering missed meeting: ${meeting.id} — ${meeting.title}`);
 
@@ -269,18 +313,29 @@ export class CallReviewWorkflow extends WorkflowEntrypoint<Env, WorkflowParams> 
     }
 
     // Step 2: Generate AI review
-    const transcriptText = transcript.sentences
+    const fullTranscriptText = transcript.sentences
       .map((s: any) => `${s.speaker_name}: ${s.text}`)
       .join('\n');
+
+    // Truncate long transcripts: keep opening (first 15k chars) + closing (last 10k chars)
+    // to stay within model context window while capturing the most important parts of the call
+    const MAX_CHARS = 25000;
+    const transcriptText = fullTranscriptText.length <= MAX_CHARS
+      ? fullTranscriptText
+      : fullTranscriptText.slice(0, 15000)
+        + '\n\n[... middle section truncated for length ...]\n\n'
+        + fullTranscriptText.slice(-10000);
 
     const review = await step.do('generate review', {
       retries: { limit: 2, delay: '15 seconds', backoff: 'exponential' },
       timeout: '5 minutes',
     }, async () => {
-      const playbook = await this.env.PLAYBOOK_KV.get('metana-playbook') ?? '';
+      const rawPlaybook = await this.env.PLAYBOOK_KV.get('metana-playbook') ?? '';
+      // Playbook can be 100k+ chars — cap at 20k to leave room for transcript + output
+      const playbook = rawPlaybook.slice(0, 20000);
 
-      const response = await this.env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-        max_tokens: 4000,
+      const response = await this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+        max_tokens: 2000,
         messages: [
           {
             role: 'user',
@@ -343,7 +398,7 @@ Always respond using exactly the format requested. No extra commentary outside t
             content: `Analyze this sales call transcript and provide a full Apex coaching review.
 
 Call Title: ${transcript.title}
-Duration: ${transcript.duration} minutes
+Duration: ${Math.round(transcript.duration)} minutes
 Date: ${new Date(transcript.date).toLocaleDateString()}
 
 Transcript:
@@ -475,9 +530,9 @@ Provide your review in this EXACT seven-step format:
     }, async () => {
       const noteBody = `📞 CALL REVIEW — ${transcript.title}
 Date: ${new Date(transcript.date).toLocaleDateString()}
-Duration: ${transcript.duration} mins
+Duration: ${Math.round(transcript.duration)} mins
 
-${review}`;
+${markdownToHtml(review)}`;
 
       const res = await fetch('https://api.hubapi.com/engagements/v1/engagements', {
         method: 'POST',
@@ -556,6 +611,7 @@ ${review}`;
                 fields: [
                   { type: 'mrkdwn', text: `*Closer*\n${closerName}` },
                   { type: 'mrkdwn', text: `*Lead*\n${hubspotContact.fullName}` },
+                  { type: 'mrkdwn', text: `*Score*\n${score !== null ? `${score}/100` : 'N/A'}` },
                 ],
               },
               {
