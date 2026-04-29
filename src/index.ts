@@ -163,6 +163,9 @@ export default {
       return new Response('Already processed', { status: 200 });
     }
 
+    // Wait 60s for Fireflies to finish processing transcript before fetching
+    await new Promise(resolve => setTimeout(resolve, 60000));
+
     // Fetch transcript from Fireflies to get participants
     let transcript: any;
     try {
