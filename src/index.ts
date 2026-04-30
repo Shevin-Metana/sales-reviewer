@@ -1,9 +1,9 @@
 import { WorkflowEntrypoint, WorkflowStep, WorkflowEvent } from 'cloudflare:workers';
 
 const CLOSER_EMAILS = [
-  'giorgio@metana.io',
   'nicoleta@metana.io',
-  'james@metana.io',
+  'danuka@metana.io',
+  'imeth@metana.io',
 ];
 
 type Env = {
@@ -12,6 +12,7 @@ type Env = {
   FIREFLIES_API_KEY: string;
   HUBSPOT_ACCESS_TOKEN: string;
   SLACK_WEBHOOK_URL: string;
+  SLACK_ALERTS_WEBHOOK_URL: string;
   SLACK_DISABLED?: string;
   AI: Ai;
   DB: D1Database;
@@ -99,7 +100,10 @@ async function fetchRecentFirefliesMeetings(apiKey: string) {
     body: JSON.stringify({ query }),
   });
 
-  if (!res.ok) throw new Error(`Fireflies poll error: ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Fireflies poll error: ${res.status} — ${body}`);
+  }
   const data = await res.json() as any;
   if (data.errors) throw new Error(`GraphQL error: ${JSON.stringify(data.errors)}`);
 
@@ -230,7 +234,18 @@ export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     console.log('Cron running — checking for missed meetings');
 
-    const recentMeetings = await fetchRecentFirefliesMeetings(env.FIREFLIES_API_KEY);
+    let recentMeetings: any[];
+    try {
+      recentMeetings = await fetchRecentFirefliesMeetings(env.FIREFLIES_API_KEY);
+    } catch (e: any) {
+      console.error('Failed to fetch recent meetings from Fireflies:', e.message);
+      await fetch(env.SLACK_ALERTS_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: `⚠️ *sales-reviewer cron failed*\n${e.message}` }),
+      }).catch(() => {});
+      return;
+    }
     console.log(`Found ${recentMeetings.length} recent meetings`);
 
     for (const meeting of recentMeetings) {
