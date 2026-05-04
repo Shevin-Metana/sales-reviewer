@@ -86,7 +86,6 @@ async function fetchRecentFirefliesMeetings(apiKey: string) {
         id
         title
         date
-        participants
       }
     }
   `;
@@ -255,33 +254,10 @@ export default {
         continue;
       }
 
-      // Parse participants from the flat string Fireflies returns
-      const participantEmails = (meeting.participants as string[])
-        .flatMap((p: string) => p.split(','))
-        .map((e: string) => e.trim().toLowerCase())
-        .filter((e: string) => e.includes('@'));
-
-      const hasCloser = participantEmails.some(e => CLOSER_EMAILS.includes(e));
-      if (!hasCloser) {
-        console.log(`No closer in meeting: ${meeting.id}`);
-        continue;
-      }
-
       if (!meeting.title?.includes('Metana Career Consultation')) {
         console.log(`Not a career consultation: ${meeting.id}`);
         continue;
       }
-
-      // Build participants array for workflow
-      const participants = participantEmails
-        .filter(e => !e.includes('fireflies'))
-        .map(email => {
-          const prefix = email.split('@')[0];
-          return {
-            email,
-            name: prefix.charAt(0).toUpperCase() + prefix.slice(1),
-          };
-        });
 
       console.log(`Triggering missed meeting: ${meeting.id} — ${meeting.title}`);
 
@@ -291,7 +267,7 @@ export default {
           params: {
             meetingId: meeting.id,
             title: meeting.title,
-            participants,
+            participants: [],
           },
         });
       } catch (e: any) {
@@ -329,6 +305,26 @@ export class CallReviewWorkflow extends WorkflowEntrypoint<Env, WorkflowParams> 
       ).bind(event.payload.meetingId, null, null, null, null, Date.now()).run();
       return;
     }
+
+    // Derive participants from transcript (handles cron path where payload.participants is empty)
+    const participantEmails = (transcript.participants as string[])
+      .flatMap((p: string) => p.split(','))
+      .map((e: string) => e.trim().toLowerCase())
+      .filter((e: string) => e.includes('@') && !e.includes('fireflies'));
+
+    const hasCloser = participantEmails.some(e => CLOSER_EMAILS.includes(e));
+    if (!hasCloser) {
+      console.log('No closer in call — skipping');
+      await this.env.DB.prepare(
+        'INSERT OR IGNORE INTO processed_meetings (meeting_id, closer_email, closer_name, lead_name, score, processed_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).bind(event.payload.meetingId, null, null, null, null, Date.now()).run();
+      return;
+    }
+
+    const participants = participantEmails.map(email => {
+      const prefix = email.split('@')[0];
+      return { email, name: prefix.charAt(0).toUpperCase() + prefix.slice(1) };
+    });
 
     // Step 2: Generate AI review
     const fullTranscriptText = transcript.sentences
@@ -512,7 +508,7 @@ Provide your review in this EXACT seven-step format:
       retries: { limit: 3, delay: '10 seconds', backoff: 'exponential' },
       timeout: '1 minute',
     }, async () => {
-      const prospectEmail = event.payload.participants
+      const prospectEmail = participants
         .find(p => !CLOSER_EMAILS.includes(p.email.toLowerCase()))?.email;
 
       if (!prospectEmail) throw new Error('No prospect email found');
@@ -577,7 +573,7 @@ ${markdownToHtml(review)}`;
 
     // Step 5: Save to D1
     await step.do('save to database', async () => {
-      const closer = event.payload.participants
+      const closer = participants
         .find(p => CLOSER_EMAILS.includes(p.email.toLowerCase()));
 
       await this.env.DB.prepare(
@@ -602,7 +598,7 @@ ${markdownToHtml(review)}`;
         retries: { limit: 3, delay: '10 seconds', backoff: 'exponential' },
         timeout: '30 seconds',
       }, async () => {
-        const closerName = event.payload.participants
+        const closerName = participants
           .find(p => CLOSER_EMAILS.includes(p.email.toLowerCase()))?.name ?? 'Unknown';
 
         const hubspotLink = `https://app.hubspot.com/contacts/20654174/contact/${hubspotContact.id}`;
