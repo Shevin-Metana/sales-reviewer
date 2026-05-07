@@ -14,6 +14,7 @@ type Env = {
   SLACK_WEBHOOK_URL: string;
   SLACK_ALERTS_WEBHOOK_URL: string;
   SLACK_DISABLED?: string;
+  DONELY_API_KEY: string;
   AI: Ai;
   DB: D1Database;
   PLAYBOOK_KV: KVNamespace;
@@ -331,26 +332,16 @@ export class CallReviewWorkflow extends WorkflowEntrypoint<Env, WorkflowParams> 
       .map((s: any) => `${s.speaker_name}: ${s.text}`)
       .join('\n');
 
-    // Truncate long transcripts: keep opening (first 15k chars) + closing (last 10k chars)
-    // to stay within model context window while capturing the most important parts of the call
-    const MAX_CHARS = 25000;
-    const transcriptText = fullTranscriptText.length <= MAX_CHARS
-      ? fullTranscriptText
-      : fullTranscriptText.slice(0, 15000)
-        + '\n\n[... middle section truncated for length ...]\n\n'
-        + fullTranscriptText.slice(-10000);
+    const transcriptText = fullTranscriptText;
 
     const review = await step.do('generate review', {
       retries: { limit: 2, delay: '15 seconds', backoff: 'exponential' },
       timeout: '5 minutes',
     }, async () => {
       const rawPlaybook = await this.env.PLAYBOOK_KV.get('metana-playbook') ?? '';
-      // Playbook can be 100k+ chars — cap at 20k to leave room for transcript + output
-      const playbook = rawPlaybook.slice(0, 20000);
+      const playbook = rawPlaybook.slice(0, 50000);
 
-      const response = await this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
-        max_tokens: 2000,
-        messages: [
+      const messages = [
           {
             role: 'user',
             content: `Here is the Metana sales playbook and closer handbook. Use this as context when reviewing the call:\n\n${playbook}`,
@@ -491,16 +482,45 @@ Provide your review in this EXACT seven-step format:
 [3 deep questions that could have been asked, with timestamps [MM:SS] indicating when]
 
 **Step 7: Actionable Next Steps**
-[1-2 most important things to focus on before the next sales call]`,
-          },
-        ],
-      }) as any;
+[1-2 most important things to focus on before the next sales call]
 
+After completing your full review, append this JSON on its own line with no surrounding text:
+{"apex_score": <integer_score>}`,
+          },
+      ];
+
+      try {
+        const res = await fetch('https://inference.donely.ai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this.env.DONELY_API_KEY}`,
+            'HTTP-Referer': 'https://claw.donely.ai',
+            'X-Title': 'Donely AI',
+          },
+          body: JSON.stringify({ model: 'donely/default', max_tokens: 100000, messages }),
+        });
+        if (!res.ok) throw new Error(`Donely error: ${res.status}`);
+        const data = await res.json() as any;
+        const content = data.choices?.[0]?.message?.content;
+        if (!content) throw new Error('Empty response from Donely');
+        console.log('Used Donely for review');
+        return content;
+      } catch (e: any) {
+        console.warn('Donely failed, falling back to Workers AI:', e.message);
+      }
+
+      const response = await this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+        max_tokens: 2000,
+        messages,
+      }) as any;
+      console.log('Used Workers AI (fallback) for review');
       return response.response;
     });
 
     // Extract score from review text (Apex score is out of 100)
-    const scoreMatch = review.match(/APEX SCORE:\s*(\d+)\s*\/\s*100/i);
+    const jsonScore = review.match(/\{"apex_score":\s*(\d+)\}/);
+    const scoreMatch = jsonScore ?? review.match(/APEX SCORE:\s*(\d+)\s*\/\s*100/i);
     const score = scoreMatch ? parseInt(scoreMatch[1]) : null;
 
     // Step 3: Find HubSpot contact
